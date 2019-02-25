@@ -1,0 +1,855 @@
+/* ==========================================================================================
+   Serial driver for the netBooter switched PDU.
+
+   Jeff Stevens 9/19/2018
+
+
+   Documentation
+   =============
+
+   The netBooter syntax is
+
+   [command] [arg1] [arg2]\n
+
+   The arguments must be separated by a single space.  Note that the netBooter won't process
+   the command until it receives the \n (newline).
+
+
+   The netBooter command set is as follows:
+
+   $A3 [outlet N] [off/on] : Turn outlet N off (0) or on (1)
+
+   $A4 [outlet N]          : Reboot outlet N
+
+   $A5                     : Get status
+
+   $A7 [off/on]            : Turn all outlets off (0) or on (1)
+
+   
+   The return string *for a valid command* is formatted as
+
+   [command]\n[response]\x00
+
+   where [command] is the full command (with arguments), [response] is the response code
+   or value, and \x00 is the ASCII null character (ASCII 000).  Note that the echoed command
+   and the response are separated by a \n character, and that the message is terminated by
+   the \x00 character.
+
+   Responses for $A3, $A4 and $A7 are either
+
+   $A0   : OK
+
+   $AF   : Failed
+
+   The response of the $A5 "Get status" command is one of "00", "10", "01" or "11",
+   corresponding to the state of the first and second outlets, respectively (0 = off, 1 = on).
+
+
+   If just a "\n" is sent, then the netBooter responds with a ">" prompt as follows:
+
+   \n\r\n>\x00
+
+   If the command is invalid, then an "Invalid command" response is returned, followed by
+   a ">" prompt:
+
+   [command]\n\n\r\x00Invalid command\x00\r\n>\x00
+
+   Note that there are a lot of quirks with the netBooter serial implementation,
+   so it's important to check all responses carefully.
+
+
+
+   TODO:
+
+      * Choose more meaningful error codes for parameter (i.e. out-of-range) errors
+      * Add a simulation mode handler
+
+   ========================================================================================== */
+
+
+
+
+#pragma once
+
+
+// Activate debug-level traces
+static const variable DEBUG(hslTrue);
+
+
+namespace NETBOOTER {
+
+   // ===== Private constants =====
+
+   // ML Star settings
+   static const variable SIM_SCALE(1);  // Time scaling factor for Venus simulation
+
+   // Connection settings
+   private const variable CONN_BAUD_RATE(9600);
+   private const variable CONN_PARITY("N");			// No parity
+   private const variable CONN_DATA_BITS(8);
+   private const variable CONN_STOP_BITS(1);
+   private const variable CONN_HANDSHAKE("N");		// No handshaking
+   private const variable CONN_FORMATTING("CR");	// Venus does some strange things to the response strings...
+													// Setting the formatting to "CR" was the best I could do
+													// to prevent it from stripping something important.
+													// This is explained in more detail in the SendCommand function...
+
+
+   // Command codes
+   private const variable CMD_NULL("");
+   private const variable CMD_SWITCH("$A3");
+   private const variable CMD_REBOOT("$A4");
+   private const variable CMD_GET_STATUS("$A5");
+   private const variable CMD_SWITCH_ALL("$A7");
+
+   // Command response codes
+   private const variable CMD_RET_OK("$A0");
+   private const variable CMD_RET_FAILED("$AF");
+
+   // How long to wait for a response after a command has been submitted (in seconds)
+   private const variable CMD_DELAY_NULL(0.0);
+   private const variable CMD_DELAY_STATUS(0.0);
+   private const variable CMD_DELAY_SWITCH(1.5);	// Switching takes about 1 s
+   private const variable CMD_DELAY_REBOOT(2.5);	// Rebooting takes about 2 s
+   
+   // Command timeouts
+   private const variable CMD_TIMEOUT_DEFAULT(0.5);
+   // Do different commands require different timeouts?
+
+   // Timeout modes
+   const variable TIMEOUT_MODE_WAIT(0);    		// Return when response is recieved, or when the
+												// operation times out.
+   const variable TIMEOUT_MODE_IMMEDIATE(1);	// Read the input buffer immediately.
+
+
+   // ===== Public constants =====
+
+   // The netBooter switch states
+   const variable SWITCH_STATE_OFF(0);
+   const variable SWITCH_STATE_ON(1);
+
+   // General error codes
+   const variable ERR_SUCCESS(0);
+   const variable ERR_NOT_CONNECTED(1);
+   const variable ERR_FAILED_CONNECTION(2);
+   const variable ERR_FAILED_SET_TIMEOUTS(3);
+   const variable ERR_FAILED_WRITE(4);
+   const variable ERR_FAILED_READ(5);
+   const variable ERR_NO_RESPONSE(6);
+   const variable ERR_INVALID_COMMAND(7);
+   const variable ERR_COMMAND_FAILED(8);
+   const variable ERR_UNKNOWN_RESPONSE(9);
+   const variable ERR_FAILED_DISCONNECT(10);
+   const variable ERR_ALREADY_CONNECTED(11);
+   const variable ERR_FAILED_TIMEOUT(12);
+
+
+   // ===== Global variables =====
+   file g_port;									// The serial connection handle
+   variable g_connected(hslFalse);				// Is there an active connection to the netBooter?
+   variable g_initialized(hslFalse);			// Has this library been initialized?
+   variable g_buffer("");						// I/O buffer for reading/writing to/from the Serial port.
+
+
+   // ===== Public functions =====
+   
+   // Usually the interface is defined in a separate header file;
+   // I've chosen not to do this to keep the project simple...
+   
+   function _InitLibrary() { }
+   function _ExitLibrary() { }
+
+   function Connect(variable COM, variable timeout) variable;		// Connect to the netBooter
+   function Disconnect() variable;									// Disconnect from the netBooter
+   function Initialize(variable COM) variable;						// Initialize the connection
+   function IsConnected() variable;									// Is there currently a connection to the netBooter?
+   function IsInitialized() variable;								// Is the library initialized?
+   function Terminate(variable force) variable;						// Terminate the netBooter connection cleanly
+   function NullCommand() variable;									// Send an empty command; used to see if the netBooter is online
+   function GetStatus(variable outlet, variable & status) variable;	// Get the status of a netBooter outlet
+   function Reboot(variable outlet) variable;						// Reboot a netBooter outlet
+   function Switch(variable outlet, variable state) variable;		// Switch a netBooter outlet on or off
+   function SwitchAll(variable state) variable;						// Switch both netBooter outlets on or off
+
+
+   // ===== Private functions =====
+   function SetTimeoutMode(variable mode, variable timeout) variable;
+   function SendCommand(variable command, variable arg1, variable arg2, variable delay, variable & response) variable;
+
+
+}
+
+
+
+// ========== Implementation ===========
+
+
+namespace NETBOOTER {
+
+	// Set the various read/write timeouts for the HSL "file" connection.
+   function SetTimeoutMode(variable mode, variable timeout) variable {
+		// mode: The timeout mode (TIMEOUT_MODE_WAIT, TIMEOUT_MODE_IMMEDIATE)
+		// timeout: The timeout (in seconds)
+      
+      variable result;
+
+      // One quirk of HSL is that some functions retrieve their parameters from
+	  // the calling scope, not from function arguments.
+	  // SetCommTimeouts is one such function.  It reads the following variables:
+      variable ReadIntervalTimeout(hslInfinite);
+      variable ReadTotalTimeoutMultiplier;
+      variable ReadTotalTimeoutConstant;
+      variable WriteTotalTimeoutMultiplier(0);
+      variable WriteTotalTimeoutConstant(timeout);
+
+		// The timeouts need to be set after the connection is established.
+      if (!g_connected) {
+         Trace("Error:  Can't set timeout; no active connection.");
+         return(ERR_NOT_CONNECTED);
+      }
+
+      if (mode == TIMEOUT_MODE_WAIT) {
+         // Wait until data is received, or until the operation times out
+         ReadTotalTimeoutMultiplier = hslInfinite;
+         ReadTotalTimeoutConstant = timeout;
+      }
+      if (mode == TIMEOUT_MODE_IMMEDIATE) {
+         // Read the data immediately, even if all of it hasn't arrived yet
+         ReadTotalTimeoutMultiplier = 0;
+         ReadTotalTimeoutConstant = 0;
+      }
+      if (mode != TIMEOUT_MODE_WAIT && mode != TIMEOUT_MODE_IMMEDIATE) {
+         err.Clear();
+         err.Raise("Error:  Invalid 'mode' argument.");
+      }
+
+      // Now set the timeouts
+      result = SetCommTimeouts(g_port);
+	  
+	  // Another quirk is that some functions return a 0 upon failure, while others
+	  // return non-zero upon failure.
+	  // SetCommTimeouts returns a 0 upon failure:
+      if (result == 0) {
+         Trace("Error:  Failed to set communications timeouts.");
+         return(ERR_FAILED_TIMEOUT);
+      }
+
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Establish a (clean) connection to the netBooter
+   function Connect(variable COM, variable timeout) variable {
+		// COM: The COM port number
+		// timeout:  The default command timeout (in seconds)
+
+      variable com_port;		// The COM port string (e.g. "COM1")
+      variable conn_string;		// The connection string
+      variable result;
+
+      // Only allow one connection; fail if already connected
+      if (g_connected) {
+         Trace("Error:  Already connected to the netBooter.");
+         return(ERR_ALREADY_CONNECTED);
+      }
+
+		// Clear the connection buffer
+      g_buffer = "";
+
+      // Set up the port
+      g_port.SetDelimiter(hslAsciiText);			// Tell Venus that this isn't delimited text
+      g_port.AddField(1, g_buffer, hslString);		// Attach g_buffer to the serial I/O buffer
+
+		// Set up the COM port and connection strings
+      com_port = "COM" + IStr(COM);
+		// The connection string for a serial connection is of the form
+		// "[COM port] [baud], [parity], [data bits], [stop bits], [handshake], [formatting]"
+      conn_string = com_port + " " + IStr(CONN_BAUD_RATE) + "," + CONN_PARITY + "," +
+                     IStr(CONN_DATA_BITS) + "," + IStr(CONN_STOP_BITS) + "," +
+                     CONN_HANDSHAKE + "," + CONN_FORMATTING;
+
+		// Open the connection
+      Trace("Initiating a connection to the netBooter: " + conn_string);
+      result = g_port.Open(conn_string, hslWrite);
+
+      // Caution:  file.Open returns an error code of *0* upon failure!!!
+      if (result == 0) {
+         // Could not establish the connection
+         Trace("Error:  Could not connect to the netBooter: " + IStr(result));
+         return(ERR_FAILED_CONNECTION);
+      } else {
+         Trace("netBooter connection successful.");
+      }
+
+      g_connected = hslTrue;
+
+      // Set the communication timeouts.
+      result = SetTimeoutMode(TIMEOUT_MODE_WAIT, timeout);
+      // If something fails here, just call it a loss and disconnect.
+      if (result != ERR_SUCCESS) {
+         Trace("Warning:  Could not initialize the netBooter; will disconnect.");
+         Disconnect();
+         // What if there's a failure to disconnect?  User should check the connection status anyway...
+         return(result);
+      }
+
+
+      return(ERR_SUCCESS);
+   }
+
+
+   function Disconnect() variable {
+
+      variable result;
+
+		// Check if there's an active connection
+      if (!g_connected) {
+         Trace("Error:  Could not disconnect from the netBooter:  No active connection.");
+         return(ERR_NOT_CONNECTED);
+      }
+
+      // Close the connection
+      result = g_port.Close();
+      if (result != 0) {
+         Trace("Error:  Failed to disconnect from the netBooter.");
+         return(ERR_FAILED_DISCONNECT);
+      }
+
+      g_connected = hslFalse;
+
+      return(ERR_SUCCESS);
+   }
+
+
+   // This connects, tests the netBooter by rebooting, then switches both outlets off (important!).
+   function Initialize(variable COM) variable {
+		// COM:  The COM port number
+
+		// Just some dummy results variables
+      variable result;
+      variable result2;
+
+      // If already connected, then cleanly disconnect and reconnect
+      if (g_connected) {
+
+         if (DEBUG) {
+            Trace("netBooter already connected...Will reestablish a fresh connection...");
+         }
+
+         result = Disconnect();
+         if (result != ERR_SUCCESS) {
+            Trace("Error:  Failed to initialize netBooter:  Could not reset the connection.");
+            return(result);
+         }
+      }
+
+      // Connect
+      if (DEBUG) {
+         Trace("Connecting to the netBooter...");
+      }
+      result = Connect(COM, CMD_TIMEOUT_DEFAULT);
+      if (result != ERR_SUCCESS) {
+         Trace("Error:  Failed to initialize netBooter:  Failed to connect.");
+         return(result);
+      }
+
+      // I've had trouble getting the netBooter to recognize the first command sent upon a fresh boot.
+	  // As far as I can tell, the netBooter ignores this first command, returning only the ">" prompt.
+	  // Sending a "null" command is sufficient to set it in a "ready" state.
+      if (DEBUG) {
+         Trace("Sending a Null command...");
+      }
+      result = NullCommand();
+      if (result != 0) {
+         Trace("Error:  Failed to initialize netBooter:  There was a problem with the Null command.");
+         result2 = Disconnect();
+         return(result);
+      }
+
+      // Reboot both outlets
+	  
+      if (DEBUG) {
+         Trace("Rebooting outlet 1...");
+      }
+      result = Reboot(1);
+      if (result != 0) {
+         Trace("Error:  Failed to initialize netBooter:  Could not reboot outlet 1.");
+         result2 = Disconnect();
+         return(result);
+      }
+
+      if (DEBUG) {
+         Trace("Rebooting outlet 2...");
+      }
+      result = Reboot(2);
+      if (result != 0) {
+         Trace("Error:  Failed to initialize netBooter:  Could not reboot outlet 2.");
+         result2 = Disconnect();
+         return(result);
+      }
+
+		// Switch both outlets off (maybe not necessary, but desirable for our application)
+
+      if (DEBUG) {
+         Trace("Switching both outlets off...");
+      }
+      result = SwitchAll(SWITCH_STATE_OFF);
+      if (result != 0) {
+         Trace("Error:  Failed to initialize netBooter:  Could not turn all outlets off.");
+         result2 = Disconnect();
+         return(result);
+      }
+
+      // Good to go!
+      g_initialized = hslTrue;
+
+      return(ERR_SUCCESS);
+   }
+
+
+   function IsConnected() variable {
+
+      return(g_connected);
+   }
+
+   function IsInitialized() variable {
+
+      return(g_initialized);
+   }
+
+
+   // A wrapper function to turn both outlets off before disconnecting.
+   function Terminate(variable force) variable {
+		// force:  If hslTrue, then drop the connection, even if the outlets can't be turned off
+
+      variable result1;
+      variable result2;
+
+      // Turn all outlets off, if you can
+      result1 = SwitchAll(SWITCH_STATE_OFF);
+
+      // Force a disconnect?
+      if (result1 != ERR_SUCCESS && !force) {
+         // Exit here with the error
+         Trace("netBooter error:  Could not switch all outlets off.  The connection will not be dropped.");
+         return(result1);
+      }
+      if (result1 != ERR_SUCCESS && force) {
+         Trace("netBooter error:  Could not switch all outlets off.  Will attempt to terminate the connection.");
+      }
+
+      // Close the connection
+      result2 = Disconnect();
+
+      // If there's a error here, then return the result of Disconnect.
+      // If there's no error, then return the result of SwitchAll.
+      // (The downside here is that this masks any error with SwitchAll if force = True.)
+      if (result2 != ERR_SUCCESS) {
+         return(result2);
+      } else {
+         return(result1);
+      }
+
+   }
+
+
+   // Send an empty string command (mostly to place the controller into a "ready" state)
+   function NullCommand() variable {
+      
+      variable result;
+      variable response;
+      string response_str;		// For casting the response as a "string" object
+      variable second;			// The second character of the response
+      
+      // Send the command
+      result = SendCommand(CMD_NULL, "", "", CMD_DELAY_NULL, response);
+      if (result != 0) {
+         Trace("Error:  Error in executing the 'Null' command.");
+         return(result);
+      }
+
+      // The response should be something line "\r>" or "\n>" (I don't know which)...
+      // Either way, only the second character is relevant.
+      response_str = response;				// Cast the response as a "string" object,
+											// for accessing the string.Right() method
+      second = response_str.Right(1);
+
+		// Panic if the response isn't a prompt
+      if (second != ">" ) {
+         Trace("netBooter Error:  Unknown response to the Null command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Return the on/off state of the two outlets
+   function GetStatus(variable & status1, variable & status2) variable {
+		// status1:  Reference for returning the status of the first outlet
+		// status2:  Reference for returning the status of the first outlet
+
+      variable result;
+      variable response;
+      string status_str;
+      string status1_str;
+      string status2_str;
+
+
+      // Send the command and check the result
+      result = SendCommand(CMD_GET_STATUS, "", "", CMD_DELAY_STATUS, response);
+      if (result != ERR_SUCCESS) {
+         Trace("Error:  Error in executing the 'GetStatus' command.");
+         return(result);
+      }
+
+      // Check the return value
+      if (response != "00" && response != "10" && response != "01" && response != "11") {
+         Trace("netBooter error:  Unknown response to GetStatus command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+
+      // Check the outlet status
+      status_str = response;					// Cast the response to a "string" object,
+												// for accessing the string.Mid() method
+
+      status1_str = status_str.Mid(0, 1);
+      status1 = IVal(status1_str);
+
+      status2_str = status_str.Mid(1,1);
+      status2 = IVal(status2_str);
+
+      if (DEBUG) {
+         Trace("Outlet 1 status: " + IStr(status1));
+         Trace("Outlet 2 status: " + IStr(status2));
+      }
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Reboot an outlet
+   function Reboot(variable outlet) variable {
+		// outlet:  The outlet number (1 or 2)
+
+      variable arg;
+      variable result;
+      variable response;
+
+      // Check the argument
+      if (outlet != 1 && outlet != 2) {
+         err.Clear();
+         err.Raise(-1, "Bad argument: 'outlet' must be either 0 or 1.");
+      }
+
+      // Send the command
+      arg = IStr(outlet);
+      result = SendCommand(CMD_REBOOT, arg, "", CMD_DELAY_REBOOT, response);
+      if (result != 0) {
+         return(result);
+      }
+
+      // Check the response
+	  // The only valid responses are CMD_RET_FAILED and CMD_RET_OK...
+      if (response == CMD_RET_FAILED) {
+         Trace("netBooter error:  Reboot command failed.");
+         return(ERR_COMMAND_FAILED);
+      }
+      if (response != CMD_RET_OK) {
+         Trace("netBooter error:  Unknown response to Reboot command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Switch an outlet on or off
+   function Switch(variable outlet, variable state) variable {
+		// outlet: The outlet number (1 or 2)
+		// state:  The on/off state to switch to (SWITCH_STATE_ON or SWITCH_STATE_OFF)
+
+      variable arg1;
+      variable arg2;
+      variable result;
+      variable response;
+
+      // Check the arguments
+      if (outlet != 1 && outlet != 2) {
+         err.Clear();
+         err.Raise(-1, "Bad argument: 'outlet' must be either 0 or 1.");
+      }
+      if (state != SWITCH_STATE_OFF && state != SWITCH_STATE_ON) {
+         err.Clear();
+         err.Raise(-1, "Bad argument: 'state' must be either 0 or 1.");
+      }
+
+      // Send the command
+      arg1 = IStr(outlet);
+      arg2 = IStr(state);
+      result = SendCommand(CMD_SWITCH, arg1, arg2, CMD_DELAY_SWITCH, response);
+      if (result != 0) {
+         return(result);
+      }
+
+      // Check the response
+	  // The only valid responses are CMD_RET_FAILED and CMD_RET_OK...
+      if (response == CMD_RET_FAILED) {
+         Trace("netBooter error:  Switch On/Off command failed.");
+         return(ERR_COMMAND_FAILED);
+      }
+      if (response != CMD_RET_OK) {
+         Trace("netBooter error:  Unknown response to Switch On/Off command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Switch both outlets on or off, concurrently.
+   function SwitchAll(variable state) variable {
+		// state:  The on/off state to switch the outlets to (SWITCH_STATE_ON or SWITCH_STATE_OFF)
+
+      variable arg;
+      variable result;
+      variable response;
+
+      // Check the input
+      if (state != SWITCH_STATE_OFF && state != SWITCH_STATE_ON) {
+         err.Clear();
+         err.Raise(-1, "Bad argument: 'state' must be either 0 or 1.");
+      }
+
+      // Send the command
+      arg = IStr(state);
+      result = SendCommand(CMD_SWITCH_ALL, arg, "", CMD_DELAY_SWITCH, response);
+      if (result != 0) {
+         return(result);
+      }
+
+      // Check the response
+	  // The only valid responses are CMD_RET_FAILED and CMD_RET_OK...
+      if (response == CMD_RET_FAILED) {
+         Trace("netBooter error:  Switch All On/Off command failed.");
+         return(ERR_COMMAND_FAILED);
+      }
+      if (response != CMD_RET_OK) {
+         Trace("netBooter error:  Unknown response to Switch All On/Off command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+
+      return(ERR_SUCCESS);
+   }
+
+
+	// Convenience function for sending commands to the netBooter.
+	// This handles all the messiness when working with this device and Venus.
+   function SendCommand(variable command, variable arg1, variable arg2, variable delay, variable & response) variable {
+		// command:		The commmand constant (CMD_NULL, etc.)
+		// arg1:		The first argument of the command (if any)
+		// arg2:		The second argument of the command (if any)
+		// delay:		How long to wait for the operation to complete (for the Reboot and Switch commands)
+		// response:	A reference returning the response from the netBooter
+
+      variable result;
+      variable command_str;
+      timer sleep;
+
+      // Check that the connection is established
+      if (!g_connected) {
+         Trace("Error:  Not currently connected to the netBooter.");
+         return(ERR_NOT_CONNECTED);
+      }
+
+      // Unfortunately the response for invalid commands seems to be impossible to parse,
+      // due to the way Venus handles null characters in the stream.  Changing the EOF doesn't
+	  // appear to work.  It's easiest just to ensure that the command is valid up-front:
+      if (command != "" && command != CMD_SWITCH && command != CMD_REBOOT && command != CMD_GET_STATUS && command != CMD_SWITCH_ALL) {
+         Trace("Error:  Invalid netBooter command.");
+         return(ERR_INVALID_COMMAND);
+      }
+
+      // Check the input arguments
+	  
+	  // For commands with no argments, arg1 and arg2 must be empty strings.
+	  // For commands with one argment, arg2 must be an empty string.
+	  // Enforcement here is better practice than just ignoring the unused arguments.
+
+      // 0-argument commands
+      if (command == "" || command == CMD_GET_STATUS) {
+         if (arg1 != "" || arg2 != "") {
+            err.Clear();
+            err.Raise(-1, "Bad argument:  'arg1' and 'arg2' must be null for this command.");
+         }
+      }
+      
+      // 1-argument commands
+      if (command == CMD_REBOOT || command == CMD_SWITCH_ALL) {
+         if (arg1 == "") {
+            err.Clear();
+            err.Raise(-1, "Bad argument:  'arg1' can't be null for this command.");
+         }
+         if (arg2 != "") {
+            err.Clear();
+            err.Raise(-1, "Bad argument:  'arg2' must be null for this command.");
+         }
+      }
+
+      // 2-argument commands
+      if (command == CMD_SWITCH) {
+			// Both arguments should be non-null
+         if (arg1 == "" || arg2 == "") {
+            err.Clear();
+            err.Raise(-1, "Bad argument:  'arg1' and 'arg2' must be non-null for this command.");
+         }
+      }
+      
+
+      // The formatting of the netBooter response codes causes some problems for Venus.
+
+      // Setting the formatting to "N" will retrieve all characters up to the first null character
+      // at once, but it always waits for the timeout.  Setting the formatting to "CR" gets around
+      // this (returning the response immediately), but each ReadRecord call retrieves just 1 line.
+
+      // There's the further complication that after retrieving the first line, Venus
+      // waits to for the timeout to retrieve subsequent lines.  Fortunately, the delay can be avoided
+      // by setting SetTimeoutMode to "immediate" mode after the first read.
+
+
+      // "Wait" mode is necessary for writing the command, and for receiving the echoed "command" part
+      // of the response...
+
+      result = SetTimeoutMode(TIMEOUT_MODE_WAIT, CMD_TIMEOUT_DEFAULT);
+      if (result != ERR_SUCCESS) {
+         Trace("Error:  Could not set the command to the netbooter:  Could not set the timeout.");
+         return(result);
+      }
+
+      // Construct the command string and send the command
+	  
+      if (arg1 == "") {
+         command_str = command;
+      } else {
+         if (arg2 == "") {
+            command_str = "" + command + " " + arg1;
+         } else {
+            command_str = "" + command + " " + arg1 + " " + arg2;
+         }
+      }
+
+      if (DEBUG) {
+         Trace("Issuing command '" + command_str + "' to the netBooter.");
+      }
+
+      result = g_port.WriteString(command_str);
+      if (result == 0) {
+         Trace("Error:  Failed to write to the netBooter connection.");
+         return(ERR_FAILED_WRITE);
+      }
+
+
+      // Get the first line of the response
+      g_buffer = "";
+      result = g_port.ReadRecord();
+      // This will return 0 if the buffer is empty, or if an error has occurred (e.g. timeout).
+	  // In either case the buffer remains unchanged.  This is a poor design, since it leaves
+	  // no way of distinguishing a empty-string response from an error condition...
+      if (result == 0 && command != CMD_NULL) {
+         Trace("Error:  Error in reading the netBooter response.");
+         return(ERR_FAILED_READ);
+      }
+
+      if (DEBUG) {
+         Trace("netBooter response (first line): " + g_buffer);
+      }
+
+      // Though the first line should match the command just sent, in practice characters
+      // are often dropped.  Not sure what's going on here.
+	  // Consequently, this line shouldn't be used to check the response.
+      
+      // I'll keep this code in case I figure out what's going on
+      /*
+      if (g_buffer != command_str) {
+         Trace("netBooter error:  The first field of the response doesn't match the command.");
+         return(ERR_UNKNOWN_RESPONSE);
+      }
+      */
+      
+
+      // Now get the response line
+
+      // Force Venus to read the input buffer immediately, to prevent timeouts for non-\r
+	  // and non-\n-terminated lines.
+      result = SetTimeoutMode(TIMEOUT_MODE_IMMEDIATE, CMD_TIMEOUT_DEFAULT);
+      if (result != ERR_SUCCESS) {
+         Trace("Error:  Could not send the command to the netbooter:  Could not set the port timeouts.");
+         return(result);
+      }
+
+      // Read the next line
+      g_buffer = "";
+      result = g_port.ReadRecord();
+
+      if (DEBUG) {
+         Trace("netBooter response (second line): " + g_buffer);
+      }
+
+      // The result of a regular command shouldn't be 0...
+      if (result == 0 && command != CMD_NULL) {
+         Trace("Error:  Error in reading the netBooter response.");
+         return(ERR_FAILED_READ);
+      }
+
+      // The "prompt" response for the Null command is buried under a couple of lines...
+      if (command == CMD_NULL) {
+         g_buffer = "";
+         result = g_port.ReadRecord();
+
+         if (DEBUG) {
+            Trace("netBooter response (third line): " + g_buffer);
+         }
+
+         if (result == 0) {
+            Trace("Error:  Error in reading the netBooter response.");
+            return(ERR_FAILED_READ);
+         }
+
+         /*
+         g_buffer = "";
+         result = g_port.ReadRecord();
+
+         if (DEBUG) {
+            Trace("netBooter response (fourth line): " + g_buffer);
+         }
+
+         if (result == 0) {
+            Trace("Error:  Error in reading the netBooter response.");
+            return(ERR_FAILED_READ);
+         }
+         */
+      }
+
+      // The netBooter always returns its response immediately, not after the command completes.
+      // Unfortunately there's no (easy) way to know when a command has fully completed.
+      // Since each operation takes a fixed amount of time, adding a delay should be enough...
+      sleep.SetTimer(delay, SIM_SCALE);
+      sleep.WaitTimer(hslFalse, hslFalse);
+
+      // Set the return value here, in case the command below errors...
+      response = g_buffer;
+
+      // Now reset the timeout
+      result = SetTimeoutMode(TIMEOUT_MODE_WAIT, CMD_TIMEOUT_DEFAULT);
+      if (result != ERR_SUCCESS) {
+         Trace("Error:  Could not reset the port timeouts.");
+         return(result);
+      }
+
+
+      return(ERR_SUCCESS);
+   }
+
+}
